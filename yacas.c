@@ -1,19 +1,89 @@
+/*
+ * Franklin Wei
+ * 19 May 2018
+ * yaCAS - "Yet Another Computer Algebra System"
+ *
+ * This is a program to manipulate algebraic expressions. It features
+ * a way of representing arbitrary expressions in memory, a parser to
+ * convert to and from standard mathematical notation, and functions
+ * to simplify, differentiate, and integrate such
+ * expressions. Additionally, it can function as a simple numerical
+ * calculator.
+ *
+ * Expressions are represented by an abstract syntax tree, a node of
+ * which is represented by a "struct expression" object (see
+ * definition below). Expressions are passed by reference to most
+ * functions, but most functions will allocate an entirely new
+ * expression tree to return their results. This results in a not
+ * insignificant amount of overhead as memory allocations and frees
+ * take place, but also greatly simplifies the memory model.
+ *
+ * Variables are supported through a simple hash map. Strings are
+ * mapped to expression trees through the "struct variable" object,
+ * and the expression trees are then substituted into the computation
+ * as needed. There is a special variable called . that stores the
+ * result of the previous computation.
+ *
+ * Differentiation is performed recursively on the expression
+ * tree. The differentiation of most expressions is performed by
+ * recursing down the tree, applying the basic rules of
+ * differentiation to combine the derivatives of child nodes. See the
+ * "diff" function for implementation.
+ *
+ * The expression parser is rather limited when it comes to
+ * tokenization. In its current form, it relies on tokens in the
+ * expression, say, "x ^ 2", being separated with spaces. That is,
+ * typing an expression like "x^2", without spaces between tokens,
+ * will result in undesired behavior (in this case, the parser wil
+ * view the token "x^2" as a variable name, not an expression). Just
+ * be sure to always separate tokens with a space, and all will be
+ * well.
+ *
+ * Finally, when using the exponential function, the form "exp ( x )"
+ * is preferred over "e ^ x", since the parser will recognize exp() as
+ * a special function and know about its special properties, while e^x
+ * will be treated as some constant raised to a power, without the
+ * special features of the exp() being recognized.
+ *
+ * Please note that this is a work in progress. The simplification,
+ * equality checking, and integration algorithms used are rudimentary
+ * at best, although differentiation should be relatively robust.
+ *
+ * Usage instructions: compile with no optimization, as this may cause
+ * undefined behavior, and link with -lm and -lreadline:
+ *
+ *    cc -O0 yacas.c -o yacas -lm -lreadline
+ *
+ * Then run with no arguments and you should be presented with a
+ * "yaCAS> " prompt. From here, you can type "help" at the command
+ * line for an overview of the basic syntax.
+ *
+ * Readline can be disabled by commenting out the #define below (in
+ * which case the getline() function will be used instead):
+ */
+
 #define USE_READLINE
 
 #include <assert.h>
 #include <ctype.h>
 #include <math.h>
+#include <setjmp.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
+
 #ifdef USE_READLINE
 #include <readline/readline.h>
 #include <readline/history.h>
 #endif
 
 /* tool for manipulating algebraic expressions */
+
+/* packed to save memory with large expressions */
 struct expression {
     char type; /* T_* */
     union {
@@ -28,15 +98,15 @@ struct expression {
             struct expression *operand, *operand2;
         } specfunc; /* T_SPECFUNC */
     };
-};
+} __attribute__((packed));
 
-enum { OP_POW = 0, OP_MUL, OP_DIV, OP_ADD, OP_SUB, OP_DIFF, OP_ASSIGN, OP_EQUALS, OP_LAST, /* not a real operator: */ OP_LPAREN };
+enum { OP_POW = 0, OP_MUL, OP_DIV, OP_ADD, OP_SUB, OP_DIFF, OP_INT, OP_ASSIGN, OP_EQUALS, OP_LAST, /* not a real operator: */ OP_LPAREN };
 enum { T_CONST = 0, T_VAR, T_SUBEXPR, T_SPECFUNC };
 enum { FN_LOG = 0, FN_EXP, FN_SIN, FN_COS, FN_TAN, FN_CSC, FN_SEC, FN_COT, FN_ASIN, FN_ACOS, FN_ATAN, FN_ACSC, FN_ASEC, FN_ACOT, FN_ABS, FN_NEGATE, FN_SQRT, FN_LAST };
 enum { RIGHT, LEFT };
 
 const char *op_names[] = {
-    "^", "*", "/", "+", "-", "diff", "=", "=="
+    "^", "*", "/", "+", "-", "diff", "int", "=", "==", "none", "("
 };
 
 const char *type_names[] = {
@@ -58,8 +128,11 @@ const char *fn_names[] = {
 bool is_constant(struct expression *expr);
 bool is_constvar(const char *name);
 bool is_var(const char *name);
+bool check_boolean(const char *varname);
 double eval_numexpr(struct expression *expr);
+double eval_numexpr_and_free(struct expression *expr);
 struct expression *diff(struct expression *expr, const char *var);
+struct expression *integrate(struct expression *expr, const char *var);
 struct expression *dup_expr(struct expression *expr);
 struct expression *eval_expr(struct expression *expr);
 struct expression *simp(struct expression *expr);
@@ -68,6 +141,16 @@ void setvar(const char *name, struct expression *value, bool constant);
 
 bool simp_progress = false;
 bool memdiag = false;
+bool interactive = true;
+bool vars_ok = true;
+
+jmp_buf restore;
+
+void __attribute__((noreturn)) fail(const char *msg)
+{
+    fprintf(stderr, "%s\n", msg);
+    longjmp(restore, 1);
+}
 
 void __attribute__((noreturn)) fatal(const char *msg)
 {
@@ -94,7 +177,7 @@ struct expression *new_var(const char *varname)
     new->varname = strdup(varname);
     memusage += sizeof(*new);
     check_mem();
-    if(memdiag)
+    if(check_boolean("memdiag"))
         printf("new var %p = %s\n", new, varname);
     return new;
 }
@@ -106,7 +189,7 @@ struct expression *new_const(double x)
     new->constant = x;
     memusage += sizeof(*new);
     check_mem();
-    if(memdiag)
+    if(check_boolean("memdiag"))
         printf("new const %p = %g\n", new, x);
     return new;
 }
@@ -120,8 +203,8 @@ struct expression *new_op(int op, struct expression *l, struct expression *r)
     new->subexpr.right = r;
     memusage += sizeof(*new);
     check_mem();
-    if(memdiag)
-        printf("new op %p\n", new);
+    if(check_boolean("memdiag"))
+        printf("new op %p %s\n", new, op_names[(int)op]);
     return new;
 }
 
@@ -132,8 +215,8 @@ struct expression *new_specfunc(int fn, struct expression *expr)
     new->specfunc.fn = fn;
     new->specfunc.operand = expr;
     memusage += sizeof(*new);
-    if(memdiag)
-        printf("new specfunc %p\n", new);
+    if(check_boolean("memdiag"))
+        printf("new specfunc %p %s\n", new, fn_names[(int)fn]);
     return new;
 }
 
@@ -155,6 +238,7 @@ int expr_prec(struct expression expr)
         case OP_EQUALS:
             return 1;
         case OP_DIFF:
+        case OP_INT:
             return 2;
         case OP_ADD:
         case OP_SUB:
@@ -192,7 +276,7 @@ void free_expr(struct expression *expr)
             break;
         }
         memusage -= sizeof(struct expression);
-        if(memdiag)
+        if(check_boolean("memdiag"))
             printf("freeing %p\n", expr);
         free(expr);
     }
@@ -215,6 +299,13 @@ struct expression *simp_and_free(struct expression *expr)
 struct expression *diff_and_free(struct expression *expr, const char *var)
 {
     struct expression *ret = diff(expr, var);
+    free_expr(expr);
+    return ret;
+}
+
+struct expression *integrate_and_free(struct expression *expr, const char *var)
+{
+    struct expression *ret = integrate(expr, var);
     free_expr(expr);
     return ret;
 }
@@ -255,6 +346,7 @@ bool expr_references(struct expression *expr, const char *varname)
 /* simple stuff, doesn't always work */
 bool expr_equals(struct expression *l, struct expression *r)
 {
+    /* first the low-hanging fruit */
     if(l == r)
         return true;
 
@@ -265,24 +357,48 @@ bool expr_equals(struct expression *l, struct expression *r)
     l = simp_and_free_max(l);
     r = simp_and_free_max(r);
 
+    /* must come after simplification */
     if(is_constant(l) && is_constant(r))
-        return eval_numexpr(l) == eval_numexpr(r);
+        return eval_numexpr_and_free(l) == eval_numexpr_and_free(r);
 
     /* not foolproof */
     if(l->type != r->type)
+    {
+        free_expr(l);
+        free_expr(r);
         return false;
+    }
+
+    bool ret = false;
 
     switch(l->type)
     {
     case T_SUBEXPR:
-        /* todo */
-        return false;
+        if(l->subexpr.op == r->subexpr.op &&
+           ((expr_equals(l->subexpr.left, r->subexpr.left) && expr_equals(l->subexpr.right, r->subexpr.right)) ||
+            (op_commutative[l->subexpr.op] &&
+             expr_equals(l->subexpr.left, r->subexpr.right) && expr_equals(l->subexpr.right, r->subexpr.left))))
+            ret = true;
+        else
+            ret = false;
+
+        free_expr(l);
+        free_expr(r);
+        return ret;
     case T_SPECFUNC:
-        return l->specfunc.fn == r->specfunc.fn && expr_equals(l->specfunc.operand, r->specfunc.operand);
+        ret = l->specfunc.fn == r->specfunc.fn && expr_equals(l->specfunc.operand, r->specfunc.operand);
+        free_expr(l);
+        free_expr(r);
+        return ret;
     case T_VAR:
         /* symbolic comparison */
         if(!is_var(l->varname) && !is_var(r->varname))
-            return !strcmp(l->varname, r->varname);
+        {
+            ret = !strcmp(l->varname, r->varname);
+            free_expr(l);
+            free_expr(r);
+            return ret;
+        }
         break;
     default:
         break;
@@ -291,14 +407,20 @@ bool expr_equals(struct expression *l, struct expression *r)
     /* try evaluating them and recurse */
     l = eval_and_free(l);
     r = eval_and_free(r);
-    return expr_equals(l, r);
+
+    ret = expr_equals(l, r);
+
+    free_expr(l);
+    free_expr(r);
+
+    return ret;
 }
 
-#define VARMAP_SIZE 10
+#define VARMAP_SIZE 20
 
 /* chained hash map */
 struct variable {
-    const char *name;
+    char *name; /* dynamic */
     struct expression *value;
     bool constant;
     struct variable *next;
@@ -331,7 +453,7 @@ bool is_constvar(const char *name)
     return false;
 }
 
-/* value must be persistent */
+/* value must be persistent, but name doesn't need to be */
 void setvar(const char *name, struct expression *value, bool constant)
 {
     uint32_t idx = var_hash(name) % VARMAP_SIZE;
@@ -369,10 +491,34 @@ void dumpvars(void)
         {
             printf("%s = ", i->name);
             print_expr(i->value);
-            printf("(%s)\n", type_names[i->value->type]);
+            printf("(%s)\n", type_names[(int)i->value->type]);
             i = i->next;
         }
     }
+}
+
+void freevars(void)
+{
+    /* can no longer access vars */
+    vars_ok = false;
+
+    for(int idx = 0; idx < VARMAP_SIZE; ++idx)
+    {
+        struct variable *i = varmap[idx];
+        while(i)
+        {
+            free_expr(i->value);
+            free(i->name);
+            struct variable *next = i->next;
+            free(i);
+            i = next;
+        }
+    }
+}
+
+void sigint(int sig)
+{
+    freevars();
 }
 
 bool is_var(const char *name)
@@ -380,6 +526,7 @@ bool is_var(const char *name)
     uint32_t idx = var_hash(name) % VARMAP_SIZE;
 
     struct variable *i = varmap[idx];
+
     while(i)
     {
         if(!strcmp(i->name, name))
@@ -403,6 +550,49 @@ struct expression *getvar(const char *name)
     }
 
     return NULL;
+}
+
+bool delvar(const char *name)
+{
+    uint32_t idx = var_hash(name) % VARMAP_SIZE;
+
+    struct variable *i = varmap[idx], *last = NULL;
+
+    while(i)
+    {
+        if(!strcmp(i->name, name))
+        {
+            if(last)
+                last->next = i->next;
+            else
+                varmap[idx] = NULL;
+            free_expr(i->value);
+            free(i->name);
+            free(i);
+            return true;
+        }
+        last = i;
+        i = i->next;
+    }
+
+    return false;
+}
+
+/* check whether a variable is nonzero without any intermediate functions */
+bool check_boolean(const char *varname)
+{
+    if(!vars_ok)
+        return false;
+    struct expression *expr = getvar(varname);
+    if(!expr)
+        return false;
+    switch(expr->type)
+    {
+    case T_CONST:
+        return expr->constant == 1;
+    default:
+        return false;
+    }
 }
 
 bool is_constant(struct expression *expr)
@@ -516,18 +706,62 @@ struct expression *eval_op(int op, struct expression *lexpr, struct expression *
 {
     if(op == OP_DIFF)
     {
-        if(rexpr->type != T_VAR)
-            fatal("diff operator must take variable as second operand");
-        return diff(eval_expr(lexpr), rexpr->varname);
+        /* allow for syntax in the form f diff x = 2 for evaluating
+         * the derivative at x = 2 */
+        switch(rexpr->type)
+        {
+        case T_VAR:
+            return diff_and_free(eval_expr(lexpr), rexpr->varname);
+        case T_SUBEXPR:
+            if(rexpr->subexpr.op == OP_ASSIGN && rexpr->subexpr.left->type == T_VAR && is_constant(rexpr->subexpr.right))
+            {
+                bool have_old = is_var(rexpr->subexpr.left->varname);
+
+                struct expression *old = NULL;
+
+                /* save state */
+                if(have_old)
+                {
+                    old = dup_expr(getvar(rexpr->subexpr.left->varname));
+                    /* delete so it's not a constant */
+                    delvar(rexpr->subexpr.left->varname);
+                }
+
+                /* get derivative */
+                struct expression *deriv = diff_and_free(eval_expr(lexpr), rexpr->subexpr.left->varname);
+
+                /* set variable (duplicate because setvar frees it later */
+                setvar(rexpr->subexpr.left->varname, dup_expr(rexpr->subexpr.right), false);
+
+                double val = eval_numexpr_and_free(deriv);
+
+                /* restore */
+                if(have_old)
+                    setvar(rexpr->subexpr.left->varname, old, false);
+                else
+                    delvar(rexpr->subexpr.left->varname);
+
+                return new_const(val);
+            }
+            /* fall through */
+        default:
+            fail("diff operator must take variable as second operand");
+        }
+    }
+    else if(op == OP_INT)
+    {
+        struct expression *result = integrate_and_free(eval_expr(lexpr), rexpr->varname);
+        if(!result)
+            return new_op(op, dup_expr(lexpr), dup_expr(rexpr));
     }
     else if(op == OP_ASSIGN)
     {
         if(lexpr->type != T_VAR)
-            fatal("assignment requires variable as first operand");
+            fail("assignment requires variable as first operand");
         if(is_constvar(lexpr->varname))
-            fatal("cannot change constant value");
+            fail("cannot change constant value");
         if(expr_references(rexpr, lexpr->varname))
-            fatal("circular reference");
+            fail("circular reference");
 
         setvar(lexpr->varname, dup_expr(rexpr), false);
         return dup_expr(rexpr);
@@ -565,7 +799,7 @@ struct expression *eval_op(int op, struct expression *lexpr, struct expression *
             ret = pow(l, r);
             break;
         default:
-            fatal("fall through");
+            fail("fall through");
         }
         return new_const(ret);
     }
@@ -579,6 +813,7 @@ struct expression *eval_expr(struct expression *expr)
     case T_CONST:
         return new_const(expr->constant);
     case T_VAR:
+        /* this could fail upon a circular reference */
         if(is_var(expr->varname))
             return eval_expr(getvar(expr->varname));
 
@@ -591,7 +826,7 @@ struct expression *eval_expr(struct expression *expr)
             return new_specfunc(expr->specfunc.fn, eval_expr(expr->specfunc.operand));
         return new_const(eval_specfunc(expr->specfunc.fn, eval_numexpr(expr->specfunc.operand)));
     default:
-        fatal("fall through");
+        fail("falll through");
     }
 }
 
@@ -609,10 +844,17 @@ double eval_numexpr(struct expression *expr)
         break;
     default:
         free_expr(result);
-        fatal("attempted to numerically evaluate non-numeric expression");
+        fail("attempted to evaluate a non-numeric expression");
     }
     free_expr(result);
     return x;
+}
+
+double eval_numexpr_and_free(struct expression *expr)
+{
+    double ret = eval_numexpr(expr);
+    free_expr(expr);
+    return ret;
 }
 
 /* returns an entirely new expression object */
@@ -750,6 +992,17 @@ struct expression *simp(struct expression *expr)
                 simp_progress = true;
                 return simp(expr->subexpr.left);
             }
+#if 0
+            if(is_constant(expr->subexpr.right) && eval_numexpr(expr->subexpr.right) < 0)
+            {
+                simp_progress = true;
+                return new_op(OP_DIV,
+                              new_const(1),
+                              new_op(OP_POW,
+                                     simp(expr->subexpr.left),
+                                     new_const(-eval_numexpr(expr->subexpr.right))));
+            }
+#endif
             if(expr->subexpr.left->type == T_SUBEXPR && expr->subexpr.left->subexpr.op == OP_POW && is_constant(expr->subexpr.left->subexpr.right) && is_constant(expr->subexpr.right))
             {
                 simp_progress = true;
@@ -757,8 +1010,9 @@ struct expression *simp(struct expression *expr)
             }
             return new_op(expr->subexpr.op, simp(expr->subexpr.left), simp(expr->subexpr.right));
         case OP_DIFF:
-            assert(expr->subexpr.right->type == T_VAR);
             return new_op(OP_DIFF, simp(expr->subexpr.left), dup_expr(expr->subexpr.right));
+        case OP_INT:
+            return new_op(OP_INT, simp(expr->subexpr.left), dup_expr(expr->subexpr.right));
         case OP_ASSIGN:
             return new_op(OP_ASSIGN, dup_expr(expr->subexpr.left), simp(expr->subexpr.right));
         case OP_EQUALS:
@@ -768,9 +1022,149 @@ struct expression *simp(struct expression *expr)
         }
         break;
     case T_SPECFUNC:
-        return new_specfunc(expr->specfunc.fn, simp(expr->specfunc.operand));
+        switch(expr->specfunc.fn)
+        {
+        case FN_NEGATE:
+            if(is_constant(expr->specfunc.operand))
+            {
+                double val = eval_numexpr(expr->specfunc.operand);
+                if(val < 0)
+                    return new_const(-val);
+            }
+            /* fall through */
+        default:
+            return new_specfunc(expr->specfunc.fn, simp(expr->specfunc.operand));
+        }
     default:
         fatal("fall through");
+    }
+}
+
+/* integrate with respect to "var", treating all other variables as
+ * CONSTANTS; probably won't work (in which case it will return NULL) */
+struct expression *integrate(struct expression *expr, const char *var)
+{
+    if(is_constant(expr))
+        return new_op(OP_MUL, new_const(eval_numexpr(expr)), new_var(var));
+
+    switch(expr->type)
+    {
+    case T_CONST:
+        return new_op(OP_MUL, new_const(expr->constant), new_var(var));
+    case T_VAR:
+        if(!strcmp(expr->varname, var))
+            return new_op(OP_MUL,
+                          new_const(.5),
+                          new_op(OP_POW,
+                                 new_var(var),
+                                 new_const(2)));
+        return new_op(OP_MUL, dup_expr(expr), new_var(var));
+    case T_SUBEXPR:
+        switch(expr->subexpr.op)
+        {
+        case OP_ADD:
+        case OP_SUB:
+        {
+            /* first try integrating both operands */
+            struct expression *lint = integrate(expr->subexpr.left, var);
+            struct expression *rint = integrate(expr->subexpr.right, var);
+            if(lint && rint)
+                return new_op(expr->subexpr.op, integrate(expr->subexpr.left, var), integrate(expr->subexpr.right, var));
+
+            free_expr(lint);
+            free_expr(rint);
+
+            /* fail */
+            return NULL;
+        }
+
+        case OP_MUL:
+        {
+            /* first try integrating both operands */
+            struct expression *lint = integrate(expr->subexpr.left, var);
+            struct expression *rint = integrate(expr->subexpr.right, var);
+
+            /* check for constant multiple */
+            if(is_constant(expr->subexpr.left))
+            {
+                return rint ? new_op(OP_MUL,
+                                     new_const(eval_numexpr(expr->subexpr.left)),
+                                     rint) : rint;
+            }
+            if(is_constant(expr->subexpr.right))
+            {
+                return lint ? new_op(OP_MUL,
+                                     new_const(eval_numexpr(expr->subexpr.right)),
+                                     lint) : lint;
+            }
+            /* disabled */
+#if 0
+            /* parts */
+            /* check if the expression is in the form u'*v and if we
+             * can integrate u and u*v' */
+            struct expression *intuvprime = integrate_and_free(simp_and_free(new_op(OP_MUL,
+                                                                                    dup_expr(lint),
+                                                                                    diff(expr->subexpr.right, var))),
+                                                               var);
+            if(lint && intuvprime)
+            {
+                return new_op(OP_SUB,
+                              new_op(OP_MUL,
+                                     lint,
+                                     dup_expr(expr->subexpr.right)),
+                              intuvprime);
+            }
+            free_expr(intuvprime);
+
+            struct expression *intuprimev = integrate_and_free(simp_and_free(new_op(OP_MUL,
+                                                                                    diff(expr->subexpr.left, var),
+                                                                                    dup_expr(rint))),
+                                                               var);
+            if(rint && intuprimev)
+            {
+                return new_op(OP_SUB,
+                              new_op(OP_MUL,
+                                     dup_expr(expr->subexpr.left),
+                                     rint),
+                              intuprimev);
+            }
+            free_expr(intuprimev);
+#endif
+            free_expr(rint);
+            free_expr(lint);
+
+            return NULL;
+        }
+        case OP_POW:
+            if(expr->subexpr.left->type == T_VAR && !strcmp(expr->subexpr.left->varname, var) && is_constant(expr->subexpr.right))
+            {
+                return new_op(OP_MUL,
+                              new_op(OP_DIV,
+                                     new_const(1),
+                                     new_const(eval_numexpr(expr->subexpr.right) + 1)),
+                              new_op(OP_POW,
+                                     new_var(expr->subexpr.left->varname),
+                                     new_const(eval_numexpr(expr->subexpr.right) + 1)));
+            }
+            /* fall through */
+        default:
+            return NULL;
+        }
+    case T_SPECFUNC:
+    {
+        switch(expr->specfunc.fn)
+        {
+        case FN_EXP:
+            if(expr->specfunc.operand->type == T_VAR && !strcmp(expr->specfunc.operand->varname, var))
+                return new_specfunc(FN_EXP, dup_expr(expr->specfunc.operand));
+            /* fall through */
+        default:
+            break;
+        }
+        /* fall through */
+    }
+    default:
+        return NULL;
     }
 }
 
@@ -786,10 +1180,10 @@ struct expression *diff(struct expression *expr, const char *var)
             return new_const(1);
         else
         {
-            if(is_var(expr->varname))
-                return diff(eval_expr(expr), var);
             //if(is_constant(expr))
             //return new_const(0);
+            if(is_var(expr->varname))
+                return diff(eval_expr(expr), var);
             return new_op(OP_DIFF, dup_expr(expr), new_var(var));
         }
     case T_SUBEXPR:
@@ -797,61 +1191,64 @@ struct expression *diff(struct expression *expr, const char *var)
         {
         case OP_ADD:
         case OP_SUB:
-            return new_op(expr->subexpr.op, simp_and_free(diff(expr->subexpr.left, var)), simp_and_free(diff(expr->subexpr.right, var)));
+            return simp_and_free(new_op(expr->subexpr.op, diff(expr->subexpr.left, var), diff(expr->subexpr.right, var)));
         case OP_MUL:
             /* f'g + fg' */
-            return new_op(OP_ADD,
-                          simp_and_free(new_op(OP_MUL, simp_and_free(diff(expr->subexpr.left, var)), dup_expr(expr->subexpr.right))),
-                          simp_and_free(new_op(OP_MUL, dup_expr(expr->subexpr.left), simp_and_free(diff(expr->subexpr.right, var)))));
+            return simp_and_free(new_op(OP_ADD,
+                                        new_op(OP_MUL, diff(expr->subexpr.left, var), dup_expr(expr->subexpr.right)),
+                                        new_op(OP_MUL, dup_expr(expr->subexpr.left), diff(expr->subexpr.right, var))));
         case OP_DIV:
-            return new_op(OP_DIV,
-                          new_op(OP_SUB,
-                                 new_op(OP_MUL, simp_and_free(diff(expr->subexpr.left, var)), dup_expr(expr->subexpr.right)),
-                                 new_op(OP_MUL, dup_expr(expr->subexpr.left), simp_and_free(diff(expr->subexpr.right, var)))),
-                          new_op(OP_POW, dup_expr(expr->subexpr.right), new_const(2)));
+            return simp_and_free(new_op(OP_DIV,
+                                        new_op(OP_SUB,
+                                               new_op(OP_MUL, diff(expr->subexpr.left, var), dup_expr(expr->subexpr.right)),
+                                               new_op(OP_MUL, dup_expr(expr->subexpr.left), diff(expr->subexpr.right, var))),
+                                        new_op(OP_POW, dup_expr(expr->subexpr.right), new_const(2))));
         case OP_POW:
             /* just n * f(x) ^ (n - 1) * f'(x) */
-#if 0
             if(is_constant(expr->subexpr.right))
             {
-                return new_op(OP_MUL,
-                              new_const(eval_numexpr(expr->subexpr.right)),
-                              new_op(OP_MUL,
-                                     simp_and_free(new_op(OP_POW,
+                return simp_and_free(new_op(OP_MUL,
+                                            new_const(eval_numexpr(expr->subexpr.right)),
+                                            new_op(OP_MUL,
+                                                   new_op(OP_POW,
                                                           dup_expr(expr->subexpr.left),
                                                           new_op(OP_SUB,
                                                                  dup_expr(expr->subexpr.right),
-                                                                 new_const(1)))),
-                                     simp_and_free(diff(expr->subexpr.left, var))));
+                                                                 new_const(1))),
+                                                   diff(expr->subexpr.left, var))));
             }
             else
-#endif
             {
                 /* f^(g-1) * (gf' + fg'ln(f)) */
-                return new_op(OP_MUL,
-                              new_op(OP_POW,
-                                     dup_expr(expr->subexpr.left),
-                                     new_op(OP_SUB,
-                                            dup_expr(expr->subexpr.right),
-                                            new_const(1))),
-                              new_op(OP_ADD,
-                                     new_op(OP_MUL,
-                                            dup_expr(expr->subexpr.right),
-                                            simp_and_free(diff(expr->subexpr.left, var))),
-                                     new_op(OP_MUL,
-                                            dup_expr(expr->subexpr.left),
-                                            new_op(OP_MUL,
-                                                   simp_and_free(diff(expr->subexpr.right, var)),
-                                                   new_specfunc(FN_LOG, dup_expr(expr->subexpr.left))))));
+                return simp_and_free(new_op(OP_MUL,
+                                            new_op(OP_POW,
+                                                   dup_expr(expr->subexpr.left),
+                                                   new_op(OP_SUB,
+                                                          dup_expr(expr->subexpr.right),
+                                                          new_const(1))),
+                                            new_op(OP_ADD,
+                                                   new_op(OP_MUL,
+                                                          dup_expr(expr->subexpr.right),
+                                                          diff(expr->subexpr.left, var)),
+                                                   new_op(OP_MUL,
+                                                          dup_expr(expr->subexpr.left),
+                                                          new_op(OP_MUL,
+                                                                 diff(expr->subexpr.right, var),
+                                                                 new_specfunc(FN_LOG, dup_expr(expr->subexpr.left)))))));
             }
         case OP_DIFF:
-            return diff_and_free(diff(expr->subexpr.left, expr->subexpr.right->varname), var);
+            return simp_and_free(new_op(OP_DIFF, dup_expr(expr), new_var(var)));
+        case OP_INT:
+            /* d/dx int f(x) dx = f(x) */
+            if(expr->subexpr.right->type == T_VAR && !strcmp(expr->subexpr.right->varname, var))
+                return simp(expr->subexpr.left);
+
+            /* otherwise return nothing */
+            return simp_and_free(new_op(OP_INT, dup_expr(expr), new_var(var)));
         case OP_ASSIGN:
-            /* todo: how to make this logical? */
-            break;
+            fail("cannot differentiate assignment operator (did you mean == ?)");
         case OP_EQUALS:
-            /* todo: how to make this logical? */
-            break;
+            return simp_and_free(new_op(OP_EQUALS, diff(expr->subexpr.left, var), diff(expr->subexpr.right, var)));
         default:
             fatal("fall through");
         }
@@ -859,73 +1256,73 @@ struct expression *diff(struct expression *expr, const char *var)
         switch(expr->specfunc.fn)
         {
         case FN_LOG:
-            return new_op(OP_DIV,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
-                          dup_expr(expr->specfunc.operand));
+            return simp_and_free(new_op(OP_DIV,
+                                        diff(expr->specfunc.operand, var),
+                                        dup_expr(expr->specfunc.operand)));
         case FN_EXP:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
-                          new_specfunc(FN_EXP, dup_expr(expr->specfunc.operand)));
+            return simp_and_free(new_op(OP_MUL,
+                                        diff(expr->specfunc.operand, var),
+                                        new_specfunc(FN_EXP, dup_expr(expr->specfunc.operand))));
         case FN_SIN:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_specfunc(FN_COS, dup_expr(expr->specfunc.operand)),
-                          simp_and_free(diff(expr->specfunc.operand, var)));
+                                        diff(expr->specfunc.operand, var)));
         case FN_COS:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_const(-1),
                           new_op(OP_MUL,
                                  new_specfunc(FN_SIN, dup_expr(expr->specfunc.operand)),
-                                 simp_and_free(diff(expr->specfunc.operand, var))));
+                                 diff(expr->specfunc.operand, var))));
         case FN_TAN:
-            return new_op(OP_DIV,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_DIV,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_POW,
                                  new_specfunc(FN_COS,
                                               dup_expr(expr->specfunc.operand)),
-                                 new_const(2)));
+                                 new_const(2))));
         case FN_CSC:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_const(-1),
                           new_op(OP_MUL,
-                                 simp_and_free(diff(expr->specfunc.operand, var)),
+                                 diff(expr->specfunc.operand, var),
                                  new_op(OP_POW,
                                         new_op(OP_SUB,
                                                new_const(1),
                                                new_op(OP_POW,
                                                       dup_expr(expr->specfunc.operand),
                                                       new_const(2))),
-                                        new_const(-.5))));
+                                        new_const(-.5)))));
         case FN_SEC:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_MUL,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_POW,
                                  new_op(OP_SUB,
                                         new_const(1),
                                         new_op(OP_POW,
                                                dup_expr(expr->specfunc.operand),
                                                new_const(2))),
-                                 new_const(-.5)));
+                                 new_const(-.5))));
         case FN_COT:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_const(-1),
                           new_op(OP_MUL,
-                                 simp_and_free(diff(expr->specfunc.operand, var)),
+                                 diff(expr->specfunc.operand, var),
                                  new_op(OP_POW,
                                         new_specfunc(FN_CSC, dup_expr(expr->specfunc.operand)),
-                                        new_const(2))));
+                                        new_const(2)))));
         case FN_ASIN:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_MUL,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_POW,
                                  new_op(OP_SUB,
                                         new_const(1),
                                         new_op(OP_POW,
                                         dup_expr(expr->specfunc.operand),
                                                new_const(2))),
-                                 new_const(-.5)));
+                                 new_const(-.5))));
         case FN_ACOS:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_MUL,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_MUL,
                                  new_const(-1),
                                  new_op(OP_POW,
@@ -934,20 +1331,20 @@ struct expression *diff(struct expression *expr, const char *var)
                                                new_op(OP_POW,
                                                       dup_expr(expr->specfunc.operand),
                                                       new_const(2))),
-                                        new_const(-.5))));
+                                        new_const(-.5)))));
         case FN_ATAN:
-            return new_op(OP_DIV,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_DIV,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_ADD,
                                  new_const(1),
                                  new_op(OP_POW,
                                         dup_expr(expr->specfunc.operand),
-                                        new_const(2))));
+                                        new_const(2)))));
         case FN_ACSC:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_const(-1),
                           new_op(OP_MUL,
-                                 simp_and_free(diff(expr->specfunc.operand, var)),
+                                 diff(expr->specfunc.operand, var),
                                  new_op(OP_DIV,
                                         new_op(OP_POW,
                                                new_op(OP_SUB,
@@ -956,10 +1353,10 @@ struct expression *diff(struct expression *expr, const char *var)
                                                              new_const(2)),
                                                       new_const(1)),
                                                new_const(-.5)),
-                                        new_specfunc(FN_ABS, dup_expr(expr->specfunc.operand)))));
+                                        new_specfunc(FN_ABS, dup_expr(expr->specfunc.operand))))));
         case FN_ASEC:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_MUL,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_DIV,
                                  new_op(OP_POW,
                                         new_op(OP_SUB,
@@ -968,32 +1365,32 @@ struct expression *diff(struct expression *expr, const char *var)
                                                       new_const(2)),
                                                new_const(1)),
                                         new_const(-.5)),
-                                 new_specfunc(FN_ABS, dup_expr(expr->specfunc.operand))));
+                                 new_specfunc(FN_ABS, dup_expr(expr->specfunc.operand)))));
         case FN_ACOT:
-            return new_op(OP_MUL,
+            return simp_and_free(new_op(OP_MUL,
                           new_const(-1),
                           new_op(OP_DIV,
-                                 simp_and_free(diff(expr->specfunc.operand, var)),
+                                 diff(expr->specfunc.operand, var),
                                  new_op(OP_ADD,
                                         new_const(1),
                                         new_op(OP_POW,
                                                dup_expr(expr->specfunc.operand),
-                                               new_const(2)))));
+                                               new_const(2))))));
         case FN_ABS:
-            return new_op(OP_MUL,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_MUL,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_DIV,
                                  new_specfunc(FN_ABS, dup_expr(expr->specfunc.operand)),
-                                 dup_expr(expr->specfunc.operand)));
+                                 dup_expr(expr->specfunc.operand))));
         case FN_NEGATE:
-            return new_specfunc(FN_NEGATE, simp_and_free(diff(expr->specfunc.operand, var)));
+            return simp_and_free(new_specfunc(FN_NEGATE, diff(expr->specfunc.operand, var)));
         case FN_SQRT:
-            return new_op(OP_DIV,
-                          simp_and_free(diff(expr->specfunc.operand, var)),
+            return simp_and_free(new_op(OP_DIV,
+                          diff(expr->specfunc.operand, var),
                           new_op(OP_MUL,
                                  new_const(2),
                                  new_specfunc(FN_SQRT,
-                                              dup_expr(expr->specfunc.operand))));
+                                              dup_expr(expr->specfunc.operand)))));
         default:
             fatal("fall through");
         }
@@ -1111,6 +1508,10 @@ void free_stacks(struct expression **opstack, int osp, struct expression **numst
 bool is_num(const char *str)
 {
     bool had_digit = false;
+
+    if(*str == '-')
+        ++str;
+
     while(*str)
     {
         if(!(isdigit(*str) || *str == '.'))
@@ -1214,7 +1615,7 @@ struct expression *parse_expr(const char *infix)
             struct expression *op = new_op(s2op(tok), NULL, NULL);
             while(osp > 0 && (opstack[osp-1]->type == T_SPECFUNC ||
                               (expr_prec(*opstack[osp-1]) > expr_prec(*op)) ||
-                              (expr_prec(*opstack[osp-1]) == expr_prec(*op) && op_assoc[opstack[osp-1]->subexpr.op] == LEFT)))
+                              (expr_prec(*opstack[osp-1]) == expr_prec(*op) && op_assoc[(int)opstack[osp-1]->subexpr.op] == LEFT)))
             {
                 if(!execop(numstack, &nsp, opstack, &osp))
                 {
@@ -1302,57 +1703,101 @@ struct expression *parse_expr(const char *infix)
 
 int main(int argc, char *argv[])
 {
+    interactive = isatty(STDIN_FILENO);
+
+    if(interactive)
+    {
+        printf("Welcome to yaCAS!\n\nCopyright (C) 2018 Franklin Wei\n\nType \"help\" for a quick overview of the supported features.\n*** Remember to separate tokens with spaces ***\n\n");
+    }
+
+    atexit(freevars);
+
     setvar("pi", new_const(M_PI), true);
     setvar("e", new_const(M_E), true);
+    setvar("memdiag", new_const(0), false);
+    setvar(".", new_const(0), false);
+
     while(1)
     {
-        peakmem = 0;
+        if(setjmp(restore) == 0)
+        {
+            peakmem = 0;
 
-        char *line = NULL;
+            char *line = NULL;
 #ifndef USE_READLINE
-        printf("yaCAS> ");
-        fflush(stdout)
+            if(interactive)
+                printf("yaCAS> ");
+            fflush(stdout);
 
-        size_t n = 0;
-        size_t len = getline(&line, &n, stdin);
+            size_t n = 0;
+            ssize_t len = getline(&line, &n, stdin);
 
-        /* remove newline */
-        if(line[len - 1] == '\n')
-            line[len-- - 1] = '\0';
+            /* remove newline */
+            if(line[len - 1] == '\n')
+                line[len-- - 1] = '\0';
+
+            if(len < 0)
+                return 0;
 #else
-        line = readline("yaCAS> ");
-        if(line && *line)
-            add_history(line);
+            line = readline(interactive ? "yaCAS> " : "");
+            if(line && *line)
+                add_history(line);
 #endif
 
-        if(!line)
-            return 0;
+            if(!line)
+                return 0;
 
-        if(!strcmp(line, "dump"))
-        {
-            dumpvars();
+            if(!strcmp(line, "dump"))
+            {
+                dumpvars();
+                free(line);
+                continue;
+            }
+            else if(!strcmp(line, "help"))
+            {
+                printf("yaCAS requires a space between all tokens, so instead of \"x^2\", type \"x ^ 2\"\n");
+                printf("Some features in action:\n");
+
+                printf("Calculation:\n    > atan ( 1 ) / pi\n");
+                printf("Differentiation:\n    > x ^ 2 diff ( x = 2 ) -- differentiate x^2 at x=2\n    > log ( y ) * x diff x -- implicit differentiation\n    > exp ( x ^ 2 ) diff x diff ( x = 0 ) -- evaluate higher-order derivative\n");
+                printf("Integration (rudimentary):\n    > 5 * x ^ 3 int x\n");
+                printf("Special functions:\n    > exp ( pi ) - pi\n");
+                printf("Variables:\n    > y = x ^ 2 -- variables can contain other expressions\n    > y diff x -- differentiate x^2 with respect to x\n    > x = 2\n    > y\n");
+                printf("Equality testing (rudimentary):\n    > x + 2 == 2 + x\n");
+                free(line);
+                continue;
+            }
+
+            clock_t start = clock();
+
+            struct expression *top = parse_expr(line);
             free(line);
-            continue;
+
+            if(top)
+            {
+                top = eval_and_free(top);
+                top = simp_and_free_max(top);
+                print_expr(top);
+
+                printf("(%s)\n", type_names[(int)top->type]);
+
+                setvar(".", dup_expr(top), true);
+
+                free_expr(top);
+            }
+            else
+            {
+                printf("malformed expression\n");
+            }
+
+            clock_t diff = clock() - start;
+            if(diff > CLOCKS_PER_SEC / 10)
+                printf("time: %ld.%.03ld sec\n", diff / CLOCKS_PER_SEC, diff % CLOCKS_PER_SEC / (CLOCKS_PER_SEC / 1000));
+
+            if(eval_numexpr_and_free(new_var("memdiag")) == 2)
+            {
+                printf("memory: %d peak: %d\n", memusage, peakmem);
+            }
         }
-
-        struct expression *top = parse_expr(line);
-        free(line);
-
-        if(top)
-        {
-            top = eval_and_free(top);
-            top = simp_and_free_max(top);
-            print_expr(top);
-            printf("(%s)\n", type_names[top->type]);
-
-            setvar(".", dup_expr(top), true);
-
-            free_expr(top);
-        }
-        else
-            printf("malformed expression\n");
-
-        if(memdiag)
-            printf("memory: %d peak: %d\n", memusage, peakmem);
     }
 }
